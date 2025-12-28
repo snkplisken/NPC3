@@ -398,33 +398,30 @@ let activeChaosSources = [];
 init();
 
 async function init() {
-    // 0. PRELOAD ASSETS (models load in background, fallbacks used if not found)
-    preloadAssets();
-    
     // 1. SCENE SETUP
     scene = new THREE.Scene();
     scene.background = new THREE.Color(0x0a0a12);
-    scene.fog = new THREE.FogExp2(0x0a0a12, 0.018); // Less dense fog
+    scene.fog = new THREE.FogExp2(0x0a0a12, 0.018);
 
-    // High FOV + slight offset for bodycam aesthetic
+    // High FOV for bodycam aesthetic
     camera = new THREE.PerspectiveCamera(95, window.innerWidth / window.innerHeight, 0.1, 150);
     
     renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: 'high-performance' });
     renderer.setSize(window.innerWidth, window.innerHeight);
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2)); // Cap for performance
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     renderer.shadowMap.enabled = true;
     renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    renderer.toneMappingExposure = 1.8; // Brighter exposure
+    renderer.toneMappingExposure = 1.8;
     document.body.appendChild(renderer.domElement);
 
     // 2. PHYSICS WORLD
     world = new CANNON.World();
-    world.gravity.set(0, -20, 0); // Slightly stronger for snappier feel
+    world.gravity.set(0, -20, 0);
     world.broadphase = new CANNON.SAPBroadphase(world);
     world.allowSleep = true;
 
-    // Ground plane
+    // Ground plane (fallback)
     const groundBody = new CANNON.Body({ 
         type: CANNON.Body.STATIC, 
         shape: new CANNON.Plane() 
@@ -432,12 +429,18 @@ async function init() {
     groundBody.quaternion.setFromEuler(-Math.PI / 2, 0, 0);
     world.addBody(groundBody);
 
-    // 3. CREATE NPC
-    createNPC();
-
-    // 4. BUILD PROCEDURAL ENVIRONMENT
-    buildStreetEnvironment();
-    buildNavigationGrid();
+    // 3. LOAD ENVIRONMENT
+    // Try to load GLB environment first, fall back to procedural if not found
+    const glbLoaded = await loadEnvironmentGLB();
+    
+    if (!glbLoaded && CONFIG.useProcedural) {
+        console.log('Building procedural environment...');
+        buildStreetEnvironment();
+        buildNavigationGrid();
+    }
+    
+    // 4. CREATE NPC (at spawn point from GLB or default)
+    createNPC(environmentData.spawnPoint);
 
     // 5. LIGHTING
     setupLighting();
