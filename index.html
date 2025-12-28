@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>NPC BODYCAM // CIVILIAN_0jj4</title>
+    <title>NPC BODYCAM // CIVILIAN_04</title>
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&display=swap');
         
@@ -330,10 +330,13 @@
             el.textContent = status;
             el.className = '';
             
-            if (status === 'PANIC') {
+            if (status === 'PANIC' || status === 'FLEEING') {
                 el.classList.add('panic');
                 alertOverlay.classList.add('active');
-            } else if (status === 'COWERING') {
+            } else if (status === 'HIDING' || status === 'COWERING') {
+                el.classList.add('cowering');
+                alertOverlay.classList.add('active'); // Still alert while hiding
+            } else if (status === 'LOOKING' || status === 'CAUTIOUS') {
                 el.classList.add('cowering');
                 alertOverlay.classList.remove('active');
             } else {
@@ -348,10 +351,12 @@
         
         setInterval(() => {
             const status = document.getElementById('npc-status').textContent;
-            if (status === 'PANIC') {
+            if (status === 'PANIC' || status === 'FLEEING') {
                 targetHR = 140 + Math.random() * 30;
-            } else if (status === 'COWERING') {
-                targetHR = 100 + Math.random() * 20;
+            } else if (status === 'HIDING' || status === 'COWERING') {
+                targetHR = 110 + Math.random() * 25;
+            } else if (status === 'CAUTIOUS' || status === 'LOOKING') {
+                targetHR = 90 + Math.random() * 15;
             } else {
                 targetHR = 72 + Math.random() * 10;
             }

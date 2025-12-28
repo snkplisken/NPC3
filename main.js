@@ -3,6 +3,7 @@ import * as CANNON from 'cannon-es';
 import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
 import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
 import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { BodyCamShader } from './BodyCamShader.js';
 
 // --- CONFIGURATION ---
@@ -11,9 +12,145 @@ const CONFIG = {
     streetWidth: 12,
     sidewalkWidth: 4,
     buildingCount: 8,
-    chaosInterval: [15000, 30000], // Random interval between events
+    chaosInterval: [8000, 18000], // Balanced event frequency
+    chaosChainChance: 0.25,       // 25% chance of rapid follow-up event
     showDebug: false
 };
+
+// --- ASSET PATHS (point these to your own GLB models & sounds) ---
+// All paths are relative to /assets/ folder - create this folder and add your files
+const ASSETS = {
+    models: {
+        // Environment
+        building1: 'models/building_tall.glb',
+        building2: 'models/building_medium.glb', 
+        building3: 'models/building_short.glb',
+        busStop: 'models/bus_stop.glb',
+        streetLight: 'models/street_light.glb',
+        sidewalk: 'models/sidewalk.glb',
+        road: 'models/road.glb',
+        
+        // Vehicles
+        parkedCar: 'models/car_parked.glb',
+        flyingCar: 'models/car_flying.glb',
+        crashedCar: 'models/car_crashed.glb',
+        
+        // Characters
+        npcMain: 'models/npc_main.glb',       // The bodycam wearer
+        npcRunner: 'models/npc_runner.glb',   // Panicked running person
+        npcCivilian: 'models/npc_civilian.glb',
+        
+        // Props/Effects
+        debris: 'models/debris.glb',
+        muzzleFlash: 'models/muzzle_flash.glb',
+        explosionDebris: 'models/explosion_debris.glb',
+    },
+    sounds: {
+        // Ambient
+        cityAmbience: 'sounds/city_ambience.mp3',
+        wind: 'sounds/wind.mp3',
+        
+        // Events
+        gunshot: 'sounds/gunshot.mp3',
+        explosion: 'sounds/explosion.mp3',
+        carCrash: 'sounds/car_crash.mp3',
+        scream: 'sounds/scream.mp3',
+        helicopter: 'sounds/helicopter.mp3',
+        debris: 'sounds/debris_fall.mp3',
+        
+        // NPC reactions
+        breathing: 'sounds/breathing_heavy.mp3',
+        footsteps: 'sounds/footsteps_run.mp3',
+        gasp: 'sounds/gasp.mp3',
+    }
+};
+
+// --- LOADED ASSETS CACHE ---
+const loadedModels = {};
+const loadedSounds = {};
+const gltfLoader = new GLTFLoader();
+
+// Asset loading functions
+async function loadModel(key) {
+    if (loadedModels[key]) return loadedModels[key];
+    
+    const path = ASSETS.models[key];
+    if (!path) {
+        console.warn(`Model key "${key}" not found in ASSETS.models`);
+        return null;
+    }
+    
+    try {
+        const gltf = await gltfLoader.loadAsync(`./assets/${path}`);
+        loadedModels[key] = gltf.scene;
+        console.log(`Loaded model: ${key}`);
+        return gltf.scene;
+    } catch (e) {
+        // Model not found - will use procedural fallback
+        console.log(`Model "${key}" not found, using procedural mesh`);
+        return null;
+    }
+}
+
+function loadSound(key) {
+    if (loadedSounds[key]) return loadedSounds[key];
+    
+    const path = ASSETS.sounds[key];
+    if (!path) {
+        console.warn(`Sound key "${key}" not found in ASSETS.sounds`);
+        return null;
+    }
+    
+    try {
+        const audio = new Audio(`./assets/${path}`);
+        loadedSounds[key] = audio;
+        return audio;
+    } catch (e) {
+        console.log(`Sound "${key}" not found`);
+        return null;
+    }
+}
+
+// Play sound helper with volume and optional position for 3D audio
+function playSound(key, volume = 1.0, loop = false) {
+    const sound = loadSound(key);
+    if (sound) {
+        const instance = sound.cloneNode();
+        instance.volume = Math.min(1, Math.max(0, volume));
+        instance.loop = loop;
+        instance.play().catch(() => {}); // Ignore autoplay errors
+        return instance;
+    }
+    return null;
+}
+
+function stopSound(audioInstance) {
+    if (audioInstance) {
+        audioInstance.pause();
+        audioInstance.currentTime = 0;
+    }
+}
+
+// Create mesh from loaded model or fallback to procedural
+function createMeshFromModel(key, fallbackGeometry, fallbackMaterial, scale = 1) {
+    const model = loadedModels[key];
+    if (model) {
+        const clone = model.clone();
+        clone.scale.setScalar(scale);
+        clone.traverse(child => {
+            if (child.isMesh) {
+                child.castShadow = true;
+                child.receiveShadow = true;
+            }
+        });
+        return clone;
+    }
+    // Fallback to procedural mesh
+    const mesh = new THREE.Mesh(fallbackGeometry, fallbackMaterial);
+    mesh.castShadow = true;
+    mesh.receiveShadow = true;
+    return mesh;
+}
 
 // --- GLOBALS ---
 let scene, camera, renderer, composer, bodyCamPass;
@@ -25,12 +162,24 @@ let startTime = Date.now();
 let npc = {
     body: null,
     mesh: null,
-    status: 'IDLE', // IDLE, PANIC, COWERING, LOOKING
+    status: 'IDLE', // IDLE, PANIC, COWERING, LOOKING, CAUTIOUS
     targetNode: null,
     shake: 0,
-    baseRotation: new THREE.Euler(),
+    yaw: 0,      // Horizontal rotation (left/right)
+    pitch: 0,    // Vertical rotation (up/down) - clamped to prevent flip
     panicTimer: 0,
-    lastDangerPos: new THREE.Vector3()
+    lastDangerPos: new THREE.Vector3(),
+    crouchAmount: 0,  // 0 = standing, 1 = crouched
+    coverDirection: new THREE.Vector3(), // Direction to face when hiding
+    lastPos: new THREE.Vector3(),       // For stuck detection
+    stuckTime: 0,                       // How long we've barely moved
+    fleeAfterHide: false,               // After hiding, run far away from last danger before idling
+    // Smarter AI additions
+    dangerMemory: [],                   // Recent danger positions [{pos, time}]
+    alertLevel: 0,                      // 0-1, how on-edge they are
+    lastLookAroundTime: 0,              // For nervous glancing
+    breathingPhase: 0,                  // For realistic breathing motion
+    recentDangerCount: 0                // Track how many dangers recently
 };
 
 // NAVIGATION
@@ -42,9 +191,11 @@ let activeChaosSources = [];
 
 // --- INITIALIZATION ---
 init();
-animate();
 
-function init() {
+async function init() {
+    // 0. PRELOAD ASSETS (models load in background, fallbacks used if not found)
+    preloadAssets();
+    
     // 1. SCENE SETUP
     scene = new THREE.Scene();
     scene.background = new THREE.Color(0x0a0a12);
@@ -98,8 +249,31 @@ function init() {
     // 8. UI Updates
     setInterval(updateTimestamp, 100);
     
+    // 9. Start render loop
+    animate();
+    
     // Hide loading
     document.getElementById('loading').style.display = 'none';
+}
+
+// --- ASSET PRELOADING ---
+// Attempts to load all models in background - uses procedural fallbacks if not found
+async function preloadAssets() {
+    console.log('Preloading assets...');
+    
+    // Try to load all models (non-blocking, fallbacks are used if not found)
+    const modelKeys = Object.keys(ASSETS.models);
+    for (const key of modelKeys) {
+        loadModel(key).catch(() => {}); // Silent fail, procedural fallback used
+    }
+    
+    // Preload sounds (also non-blocking)
+    const soundKeys = Object.keys(ASSETS.sounds);
+    for (const key of soundKeys) {
+        loadSound(key);
+    }
+    
+    console.log('Asset preload initiated (models load in background)');
 }
 
 // --- NPC CREATION ---
@@ -480,15 +654,31 @@ function buildNavigationGrid() {
 }
 
 // --- AI LOGIC ---
-function getSafeNode(dangerPos) {
-    // Prioritize cover spots when panicking
-    const safeCover = coverSpots.filter(spot => spot.distanceTo(dangerPos) > 12);
-    if (safeCover.length > 0 && Math.random() > 0.3) {
-        return safeCover[Math.floor(Math.random() * safeCover.length)];
+function getSafeNode(dangerPos, npcPos) {
+    // ALWAYS prioritize cover spots when panicking
+    const safeCover = coverSpots.filter(spot => spot.distanceTo(dangerPos) > 8);
+    
+    if (safeCover.length > 0) {
+        // Find the closest safe cover spot to the NPC
+        let bestCover = safeCover[0];
+        let bestScore = Infinity;
+        
+        for (const spot of safeCover) {
+            // Score = distance to NPC (lower is better) - distance from danger (higher is better)
+            const distToNpc = npcPos ? spot.distanceTo(npcPos) : 0;
+            const distFromDanger = spot.distanceTo(dangerPos);
+            const score = distToNpc - distFromDanger * 0.5; // Prioritize being far from danger
+            
+            if (score < bestScore) {
+                bestScore = score;
+                bestCover = spot;
+            }
+        }
+        return bestCover;
     }
     
-    // Otherwise find distant nav node
-    const safeNodes = navNodes.filter(node => node.distanceTo(dangerPos) > 15);
+    // Fallback: find distant nav node
+    const safeNodes = navNodes.filter(node => node.distanceTo(dangerPos) > 12);
     
     if (safeNodes.length === 0) {
         let furthest = navNodes[0];
@@ -500,7 +690,55 @@ function getSafeNode(dangerPos) {
         return furthest;
     }
     
+    // Pick closest safe node to NPC
+    if (npcPos) {
+        let closest = safeNodes[0];
+        let minDist = Infinity;
+        for (const n of safeNodes) {
+            const d = n.distanceTo(npcPos);
+            if (d < minDist) { minDist = d; closest = n; }
+        }
+        return closest;
+    }
+    
     return safeNodes[Math.floor(Math.random() * safeNodes.length)];
+}
+
+function getFarSafeNode(dangerPos, npcPos) {
+    // Prefer the spot that maximizes distance from danger, with a small bias toward not being absurdly far from the NPC.
+    // This is meant for "post-hide fleeing" when the immediate danger has passed.
+    const candidates = [];
+
+    for (const spot of coverSpots) {
+        if (spot.distanceTo(dangerPos) > 8) candidates.push(spot);
+    }
+    for (const node of navNodes) {
+        if (node.distanceTo(dangerPos) > 12) candidates.push(node);
+    }
+
+    if (candidates.length === 0) {
+        // Worst-case fallback: pick the furthest nav node from danger
+        let furthest = navNodes[0];
+        let maxDist = -Infinity;
+        for (const n of navNodes) {
+            const d = n.distanceTo(dangerPos);
+            if (d > maxDist) { maxDist = d; furthest = n; }
+        }
+        return furthest;
+    }
+
+    let best = candidates[0];
+    let bestScore = -Infinity;
+    for (const c of candidates) {
+        const distFromDanger = c.distanceTo(dangerPos);
+        const distToNpc = npcPos ? c.distanceTo(npcPos) : 0;
+        const score = distFromDanger - distToNpc * 0.15;
+        if (score > bestScore) {
+            bestScore = score;
+            best = c;
+        }
+    }
+    return best;
 }
 
 function getClosestNode(pos) {
@@ -511,6 +749,43 @@ function getClosestNode(pos) {
         if (d < minDist) { minDist = d; closest = n; }
     }
     return closest;
+}
+
+// Safe camera look function - calculates yaw/pitch without flipping
+function safeLookAt(targetPos, smoothing = 0.1) {
+    const camPos = camera.position;
+    const dx = targetPos.x - camPos.x;
+    const dy = targetPos.y - camPos.y;
+    const dz = targetPos.z - camPos.z;
+    
+    // Calculate target yaw (horizontal angle)
+    const targetYaw = Math.atan2(dx, dz);
+    
+    // Calculate target pitch (vertical angle) - clamped to prevent flip
+    const horizontalDist = Math.sqrt(dx * dx + dz * dz);
+    const targetPitch = Math.atan2(dy, horizontalDist);
+    const clampedPitch = THREE.MathUtils.clamp(targetPitch, -Math.PI / 3, Math.PI / 3);
+    
+    // Smoothly interpolate to target angles
+    npc.yaw = THREE.MathUtils.lerp(npc.yaw, targetYaw, smoothing);
+    npc.pitch = THREE.MathUtils.lerp(npc.pitch, clampedPitch, smoothing);
+}
+
+// Apply the camera rotation from yaw/pitch (call after safeLookAt)
+function applyCameraRotation() {
+    // Reset camera rotation
+    camera.rotation.set(0, 0, 0);
+    camera.rotation.order = 'YXZ'; // Yaw first, then pitch - prevents gimbal lock
+    
+    // Apply yaw (Y) and pitch (X)
+    camera.rotation.y = -npc.yaw;
+    camera.rotation.x = -npc.pitch;
+    
+    // Apply shake as roll only
+    const shakeTime = clock.getElapsedTime();
+    const rollShake = Math.sin(shakeTime * 12) * npc.shake * 0.02 
+                    + Math.sin(shakeTime * 17) * npc.shake * 0.015;
+    camera.rotation.z = rollShake;
 }
 
 function updateNPC(dt) {
@@ -526,24 +801,41 @@ function updateNPC(dt) {
     if (npc.mesh) {
         npc.mesh.position.copy(pos);
     }
+
+    // Track movement to detect when we are stuck in place
+    const moved = pos.distanceTo(npc.lastPos);
+    if (moved < 0.02) {
+        npc.stuckTime += dt;
+    } else {
+        npc.stuckTime = 0;
+        npc.lastPos.copy(pos);
+    }
     
-    // Camera position (eye level)
+    // Camera position (eye level - lower when crouching)
     camera.position.copy(pos);
-    camera.position.y += 0.5;
-    
-    // Ensure camera stays upright
-    camera.up.set(0, 1, 0);
+    const standingHeight = 0.5;
+    const crouchingHeight = -0.1; // Much lower when crouched
+    camera.position.y += THREE.MathUtils.lerp(standingHeight, crouchingHeight, npc.crouchAmount);
     
     // Update panic timer
     if (npc.status === 'PANIC' || npc.status === 'COWERING') {
         npc.panicTimer -= dt;
         if (npc.panicTimer <= 0) {
-            npc.status = 'IDLE';
-            npc.targetNode = null;
+            if (npc.status === 'COWERING') {
+                // Danger "over": stop hiding and flee away from where it happened.
+                npc.status = 'PANIC';
+                npc.fleeAfterHide = true;
+                npc.panicTimer = 5 + Math.random() * 5;
+                npc.targetNode = null;
+            } else {
+                npc.status = 'IDLE';
+                npc.fleeAfterHide = false;
+                npc.targetNode = null;
+            }
         }
     }
     
-    // BEHAVIOR STATE MACHINE
+    // BEHAVIOR STATE MACHINE (each state calls safeLookAt)
     switch (npc.status) {
         case 'PANIC':
             handlePanicState(pos, dt);
@@ -561,52 +853,127 @@ function updateNPC(dt) {
             handleIdleState(pos, dt);
     }
     
-    // Apply camera shake (only roll for bodycam feel, no pitch/yaw modification)
-    const shakeTime = clock.getElapsedTime();
-    const rollShake = Math.sin(shakeTime * 12) * npc.shake * 0.02 
-                    + Math.sin(shakeTime * 17) * npc.shake * 0.015;
-    camera.rotation.z = rollShake;
+    // Apply the safe camera rotation (never flips!)
+    applyCameraRotation();
 }
 
 function handlePanicState(pos, dt) {
     // Update UI
-    if (window.updateNPCStatus) window.updateNPCStatus('PANIC');
+    if (window.updateNPCStatus) window.updateNPCStatus(npc.fleeAfterHide ? 'FLEEING' : 'PANIC');
+
+    // Make sure physics wakes up when panicking
+    npc.body.wakeUp();
     
-    // Find safe spot away from danger
+    // Keep alert level maxed while panicking
+    npc.alertLevel = 1;
+    
+    // Find safe spot away from danger (considering all remembered dangers)
     if (!npc.targetNode) {
-        npc.targetNode = getSafeNode(npc.lastDangerPos);
+        // Find the most threatening danger position (closest or most recent)
+        let primaryDanger = npc.lastDangerPos;
+        if (npc.dangerMemory.length > 0) {
+            let closestDist = Infinity;
+            for (const danger of npc.dangerMemory) {
+                const dist = pos.distanceTo(danger.pos);
+                if (dist < closestDist) {
+                    closestDist = dist;
+                    primaryDanger = danger.pos;
+                }
+            }
+        }
+        
+        npc.targetNode = npc.fleeAfterHide
+            ? getFarSafeNode(primaryDanger, pos)
+            : getSafeNode(primaryDanger, pos);
+        
+        // Calculate direction to face when hiding (away from danger)
+        if (npc.targetNode) {
+            npc.coverDirection.subVectors(npc.targetNode, primaryDanger).normalize();
+        }
+    }
+
+    // If we've been stuck for a bit, pick a new escape node
+    if (npc.stuckTime > 1 && npc.targetNode) {
+        npc.targetNode = getSafeNode(npc.lastDangerPos, pos);
+        npc.stuckTime = 0;
     }
     
     if (npc.targetNode) {
         const dir = new THREE.Vector3().subVectors(npc.targetNode, pos).normalize();
         
-        // Run speed
-        const speed = 7.5;
+        // Run speed - faster when fleeing, slightly erratic
+        const baseSpeed = npc.fleeAfterHide ? 8.5 : 7.5;
+        const speedVariation = Math.sin(clock.getElapsedTime() * 8) * 0.5;
+        const speed = baseSpeed + speedVariation;
         npc.body.velocity.x = dir.x * speed;
         npc.body.velocity.z = dir.z * speed;
+
+        // Add a sideways nudge when we're not making progress to slip around obstacles
+        if (npc.stuckTime > 0.4) {
+            const sidestep = (Math.random() - 0.5) * 4;
+            npc.body.velocity.x += -dir.z * sidestep;
+            npc.body.velocity.z += dir.x * sidestep;
+        }
         
-        // Look back at danger occasionally
+        // Start crouching as we get closer to cover
+        const distToCover = pos.distanceTo(npc.targetNode);
+        if (!npc.fleeAfterHide && distToCover < 5) {
+            npc.crouchAmount = THREE.MathUtils.lerp(npc.crouchAmount, 0.5, dt * 2);
+        } else if (npc.fleeAfterHide) {
+            // When fleeing after hiding, stand back up to sprint away.
+            npc.crouchAmount = THREE.MathUtils.lerp(npc.crouchAmount, 0.0, dt * 3);
+        }
+        
+        // Frantic looking behavior - checks surroundings more
         let lookTarget;
-        if (Math.random() > 0.95) {
+        const lookRoll = Math.random();
+        
+        if (lookRoll > 0.88) {
+            // Look back at most recent danger
             lookTarget = npc.lastDangerPos.clone();
+            lookTarget.y = camera.position.y;
+        } else if (lookRoll > 0.80 && npc.dangerMemory.length > 1) {
+            // Glance at another remembered danger
+            const otherDanger = npc.dangerMemory[Math.floor(Math.random() * npc.dangerMemory.length)];
+            lookTarget = otherDanger.pos.clone();
+            lookTarget.y = camera.position.y;
+        } else if (lookRoll > 0.75) {
+            // Quick side glance while running
+            const sideAngle = (Math.random() > 0.5 ? 1 : -1) * Math.PI / 3;
+            const runAngle = Math.atan2(dir.x, dir.z);
+            lookTarget = new THREE.Vector3(
+                pos.x + Math.sin(runAngle + sideAngle) * 5,
+                camera.position.y,
+                pos.z + Math.cos(runAngle + sideAngle) * 5
+            );
         } else {
+            // Look where running
             lookTarget = new THREE.Vector3(npc.targetNode.x, camera.position.y, npc.targetNode.z);
         }
         
-        // Add shake offset to look target
+        // Add shake offset to look target - more intense when panicking
         const shakeTime = clock.getElapsedTime();
-        lookTarget.x += Math.sin(shakeTime * 15) * npc.shake * 0.3;
-        lookTarget.y = camera.position.y + Math.sin(shakeTime * 12) * npc.shake * 0.15;
-        lookTarget.z += Math.cos(shakeTime * 13) * npc.shake * 0.3;
+        const shakeIntensity = npc.fleeAfterHide ? 0.2 : 0.35;
+        lookTarget.x += Math.sin(shakeTime * 15) * npc.shake * shakeIntensity;
+        lookTarget.z += Math.cos(shakeTime * 13) * npc.shake * shakeIntensity;
         
-        camera.lookAt(lookTarget);
+        // Use safe look (faster smoothing when panicking)
+        safeLookAt(lookTarget, 0.18);
         
-        // Check arrival
-        if (pos.distanceTo(npc.targetNode) < 2) {
-            // Transition to cowering
-            npc.status = 'COWERING';
-            npc.targetNode = null;
-            npc.panicTimer = 5 + Math.random() * 5;
+        // Check arrival at cover
+        if (distToCover < 1.5) {
+            if (npc.fleeAfterHide) {
+                // We've fled to a far spot; resume normal behavior.
+                npc.status = 'IDLE';
+                npc.fleeAfterHide = false;
+                npc.targetNode = null;
+                npc.panicTimer = 0;
+            } else {
+                // Transition to cowering/hiding
+                npc.status = 'COWERING';
+                npc.targetNode = null;
+                npc.panicTimer = 6 + Math.random() * 6;
+            }
         }
     }
     
@@ -616,56 +983,140 @@ function handlePanicState(pos, dt) {
 
 function handleCoweringState(pos, dt) {
     // Update UI
-    if (window.updateNPCStatus) window.updateNPCStatus('COWERING');
+    if (window.updateNPCStatus) window.updateNPCStatus('HIDING');
     
-    // Stop moving, look around nervously
-    npc.body.velocity.x *= 0.9;
-    npc.body.velocity.z *= 0.9;
+    // Keep alert high while hiding
+    npc.alertLevel = Math.max(0.7, npc.alertLevel);
     
-    // Nervous looking around
+    // Stop moving - pressed against cover (small trembling movements)
+    const tremble = Math.sin(clock.getElapsedTime() * 20) * 0.1;
+    npc.body.velocity.x = npc.body.velocity.x * 0.8 + tremble;
+    npc.body.velocity.z = npc.body.velocity.z * 0.8 + tremble * 0.5;
+    
+    // CROUCH DOWN - lower camera significantly
+    npc.crouchAmount = THREE.MathUtils.lerp(npc.crouchAmount, 1.0, dt * 3);
+    
+    // Safety: If coverDirection wasn't set, calculate it now (away from danger)
+    if (npc.coverDirection.lengthSq() < 0.01) {
+        npc.coverDirection.subVectors(pos, npc.lastDangerPos).normalize();
+        // If still zero (danger is at same position), pick random direction
+        if (npc.coverDirection.lengthSq() < 0.01) {
+            npc.coverDirection.set(Math.random() - 0.5, 0, Math.random() - 0.5).normalize();
+        }
+    }
+    
     const shakeTime = clock.getElapsedTime();
-    const lookTarget = new THREE.Vector3(
-        pos.x + Math.sin(shakeTime * 2) * 5,
-        camera.position.y + Math.sin(shakeTime * 3) * npc.shake * 0.1,
-        pos.z + Math.cos(shakeTime * 1.5) * 5
-    );
     
-    // Add jitter
-    lookTarget.x += Math.sin(shakeTime * 10) * npc.shake * 0.15;
-    lookTarget.z += Math.cos(shakeTime * 11) * npc.shake * 0.15;
+    // More dynamic peeking behavior
+    let lookTarget;
+    const peekPhase = Math.sin(shakeTime * 0.4);
+    const nervousGlance = Math.sin(shakeTime * 2.3) > 0.9;
     
-    camera.lookAt(lookTarget);
+    if (peekPhase > 0.6 || nervousGlance) {
+        // Peek back at danger - varies which danger we look at
+        if (npc.dangerMemory.length > 1 && Math.random() > 0.6) {
+            const danger = npc.dangerMemory[Math.floor(Math.random() * npc.dangerMemory.length)];
+            lookTarget = danger.pos.clone();
+        } else {
+            lookTarget = npc.lastDangerPos.clone();
+        }
+        lookTarget.y = camera.position.y - 0.2;
+        
+        // Quick nervous peek, not a long stare
+        if (nervousGlance) {
+            lookTarget.x += (Math.random() - 0.5) * 3;
+            lookTarget.z += (Math.random() - 0.5) * 3;
+        }
+    } else if (peekPhase < -0.5) {
+        // Look down at hands/ground (thinking/processing)
+        lookTarget = new THREE.Vector3(
+            pos.x + npc.coverDirection.x * 0.5,
+            camera.position.y - 1.2,
+            pos.z + npc.coverDirection.z * 0.5
+        );
+    } else {
+        // Face away from danger / toward wall
+        lookTarget = new THREE.Vector3(
+            pos.x + npc.coverDirection.x * 3,
+            camera.position.y - 0.5,
+            pos.z + npc.coverDirection.z * 3
+        );
+        
+        // Small nervous head movements - faster when more dangers remembered
+        const nervousness = 1 + npc.dangerMemory.length * 0.3;
+        lookTarget.x += Math.sin(shakeTime * 3 * nervousness) * 0.5;
+        lookTarget.z += Math.cos(shakeTime * 2.5 * nervousness) * 0.5;
+    }
     
-    // Moderate shake
-    npc.shake = THREE.MathUtils.lerp(npc.shake, 1.2, dt * 2);
+    // Add nervous jitter - more intense with more recent dangers
+    const jitterIntensity = 0.08 + npc.recentDangerCount * 0.03;
+    lookTarget.x += Math.sin(shakeTime * 12) * npc.shake * jitterIntensity;
+    lookTarget.z += Math.cos(shakeTime * 13) * npc.shake * jitterIntensity;
+    
+    // Use safe look - slower when hiding
+    safeLookAt(lookTarget, 0.06);
+    
+    // Trembling intensity based on recent danger count
+    const targetShake = 1.0 + npc.recentDangerCount * 0.2;
+    npc.shake = THREE.MathUtils.lerp(npc.shake, Math.min(targetShake, 2.0), dt * 2);
 }
 
 function handleLookingState(pos, dt) {
     // Update UI
     if (window.updateNPCStatus) window.updateNPCStatus('LOOKING');
     
-    // Stop and look at the chaos
-    npc.body.velocity.x *= 0.95;
-    npc.body.velocity.z *= 0.95;
+    // Increase alertness while looking at danger
+    npc.alertLevel = Math.min(1, npc.alertLevel + dt * 0.2);
     
-    // Look toward last danger with subtle shake
+    // Stand back up (but slowly, cautiously) - stay lower if very alert
+    const targetCrouch = npc.alertLevel > 0.6 ? 0.2 : 0;
+    npc.crouchAmount = THREE.MathUtils.lerp(npc.crouchAmount, targetCrouch, dt);
+    
+    // Stop and look at the chaos - slight backward drift
+    npc.body.velocity.x *= 0.92;
+    npc.body.velocity.z *= 0.92;
+    
+    // Subtle backing away if danger is close
+    const dangerDist = pos.distanceTo(npc.lastDangerPos);
+    if (dangerDist < 10) {
+        const awayDir = new THREE.Vector3().subVectors(pos, npc.lastDangerPos).normalize();
+        npc.body.velocity.x += awayDir.x * 0.5;
+        npc.body.velocity.z += awayDir.z * 0.5;
+    }
+    
     const shakeTime = clock.getElapsedTime();
-    const lookTarget = npc.lastDangerPos.clone();
+    let lookTarget;
+    
+    // Scan between different danger sources
+    const scanPhase = Math.floor(shakeTime * 0.8) % (npc.dangerMemory.length + 1);
+    
+    if (scanPhase < npc.dangerMemory.length && npc.dangerMemory.length > 0) {
+        lookTarget = npc.dangerMemory[scanPhase].pos.clone();
+    } else {
+        lookTarget = npc.lastDangerPos.clone();
+    }
     lookTarget.y = camera.position.y;
     
-    // Subtle nervous jitter while watching
-    lookTarget.x += Math.sin(shakeTime * 8) * npc.shake * 0.1;
-    lookTarget.z += Math.cos(shakeTime * 9) * npc.shake * 0.1;
+    // Nervous jitter while watching - more intense with more dangers
+    const jitter = 0.1 + npc.dangerMemory.length * 0.05;
+    lookTarget.x += Math.sin(shakeTime * 8) * npc.shake * jitter;
+    lookTarget.z += Math.cos(shakeTime * 9) * npc.shake * jitter;
     
-    camera.lookAt(lookTarget);
+    // Use safe look
+    safeLookAt(lookTarget, 0.1);
     
-    npc.shake = THREE.MathUtils.lerp(npc.shake, 0.5, dt);
+    // Shake based on proximity to danger
+    const targetShake = dangerDist < 15 ? 0.8 : 0.5;
+    npc.shake = THREE.MathUtils.lerp(npc.shake, targetShake, dt);
     
-    // After a bit, decide to run or keep watching
-    if (Math.random() < 0.01) {
-        if (Math.random() > 0.5) {
+    // Decision making - more likely to panic if multiple dangers or close
+    const panicChance = 0.008 + npc.dangerMemory.length * 0.004 + (dangerDist < 12 ? 0.01 : 0);
+    
+    if (Math.random() < panicChance) {
+        if (Math.random() > 0.35 || dangerDist < 10) {
             npc.status = 'PANIC';
-            npc.panicTimer = 8;
+            npc.panicTimer = 8 + Math.random() * 4;
+            npc.targetNode = null;
         } else {
             npc.status = 'IDLE';
         }
@@ -673,60 +1124,145 @@ function handleLookingState(pos, dt) {
 }
 
 function handleIdleState(pos, dt) {
-    // Update UI
-    if (window.updateNPCStatus) window.updateNPCStatus('IDLE');
+    // Update UI - show CAUTIOUS if alert level is high
+    if (window.updateNPCStatus) {
+        window.updateNPCStatus(npc.alertLevel > 0.3 ? 'CAUTIOUS' : 'IDLE');
+    }
     
-    // Wandering - waiting for the bus
-    if (!npc.targetNode || Math.random() > 0.997) {
-        // Pick nearby node
-        const nearbyNodes = navNodes.filter(n => n.distanceTo(pos) < 15);
-        npc.targetNode = nearbyNodes.length > 0 
-            ? nearbyNodes[Math.floor(Math.random() * nearbyNodes.length)]
-            : navNodes[Math.floor(Math.random() * navNodes.length)];
+    // Decay alert level over time
+    npc.alertLevel = Math.max(0, npc.alertLevel - dt * 0.05);
+    
+    // Clean old danger memories (older than 30 seconds)
+    const now = Date.now();
+    npc.dangerMemory = npc.dangerMemory.filter(d => now - d.time < 30000);
+    
+    // Breathing animation
+    npc.breathingPhase += dt * (1.5 + npc.alertLevel * 2); // Faster when stressed
+    
+    // Stand back up (slower if nervous)
+    const standSpeed = npc.alertLevel > 0.3 ? 1 : 2;
+    npc.crouchAmount = THREE.MathUtils.lerp(npc.crouchAmount, 0, dt * standSpeed);
+    
+    // Wandering behavior changes with alert level
+    const changeTargetChance = npc.alertLevel > 0.3 ? 0.99 : 0.997;
+    if (!npc.targetNode || Math.random() > changeTargetChance) {
+        // When nervous, stay closer / move less predictably
+        const searchRadius = npc.alertLevel > 0.3 ? 8 : 15;
+        const nearbyNodes = navNodes.filter(n => n.distanceTo(pos) < searchRadius);
+        
+        // Avoid recent danger zones when picking new targets
+        let safeNodes = nearbyNodes;
+        if (npc.dangerMemory.length > 0) {
+            safeNodes = nearbyNodes.filter(n => {
+                for (const danger of npc.dangerMemory) {
+                    if (n.distanceTo(danger.pos) < 10) return false;
+                }
+                return true;
+            });
+        }
+        
+        npc.targetNode = safeNodes.length > 0 
+            ? safeNodes[Math.floor(Math.random() * safeNodes.length)]
+            : (nearbyNodes.length > 0 
+                ? nearbyNodes[Math.floor(Math.random() * nearbyNodes.length)]
+                : navNodes[Math.floor(Math.random() * navNodes.length)]);
     }
     
     const dir = new THREE.Vector3().subVectors(npc.targetNode, pos).normalize();
     
-    // Slow walk
-    npc.body.velocity.x = dir.x * 1.8;
-    npc.body.velocity.z = dir.z * 1.8;
+    // Walking speed varies with nervousness
+    const walkSpeed = npc.alertLevel > 0.5 ? 2.8 : (npc.alertLevel > 0.2 ? 2.2 : 1.8);
+    npc.body.velocity.x = dir.x * walkSpeed;
+    npc.body.velocity.z = dir.z * walkSpeed;
     
-    // Look where walking with subtle body sway
     const shakeTime = clock.getElapsedTime();
-    const lookTarget = new THREE.Vector3(
-        npc.targetNode.x + Math.sin(shakeTime * 3) * npc.shake * 0.2,
-        camera.position.y + Math.sin(shakeTime * 4) * npc.shake * 0.05,
-        npc.targetNode.z + Math.cos(shakeTime * 3.5) * npc.shake * 0.2
-    );
-    camera.lookAt(lookTarget);
+    let lookTarget;
     
-    // Subtle body cam shake
-    npc.shake = THREE.MathUtils.lerp(npc.shake, 0.15, dt);
+    // Nervous looking around behavior
+    const timeSinceLastLook = shakeTime - npc.lastLookAroundTime;
+    const lookAroundInterval = npc.alertLevel > 0.3 ? 2 : 5;
+    
+    if (timeSinceLastLook > lookAroundInterval && Math.random() > 0.95) {
+        npc.lastLookAroundTime = shakeTime;
+        
+        // Look at a remembered danger location or random direction
+        if (npc.dangerMemory.length > 0 && Math.random() > 0.4) {
+            const danger = npc.dangerMemory[Math.floor(Math.random() * npc.dangerMemory.length)];
+            lookTarget = danger.pos.clone();
+            lookTarget.y = camera.position.y;
+        } else {
+            // Random nervous glance
+            const glanceAngle = Math.random() * Math.PI * 2;
+            lookTarget = new THREE.Vector3(
+                pos.x + Math.cos(glanceAngle) * 10,
+                camera.position.y + (Math.random() - 0.5) * 0.5,
+                pos.z + Math.sin(glanceAngle) * 10
+            );
+        }
+    } else {
+        // Normal forward-looking with breathing sway
+        const breathSway = Math.sin(npc.breathingPhase) * 0.1 * (1 + npc.alertLevel);
+        lookTarget = new THREE.Vector3(
+            npc.targetNode.x + Math.sin(shakeTime * 3) * npc.shake * 0.2 + breathSway,
+            camera.position.y + 0.3 + Math.sin(npc.breathingPhase * 0.5) * 0.05,
+            npc.targetNode.z + Math.cos(shakeTime * 3.5) * npc.shake * 0.2
+        );
+    }
+    
+    // Smoothing varies - faster head movement when nervous
+    const lookSpeed = npc.alertLevel > 0.3 ? 0.08 : 0.05;
+    safeLookAt(lookTarget, lookSpeed);
+    
+    // Shake increases with nervousness
+    const targetShake = 0.15 + npc.alertLevel * 0.4;
+    npc.shake = THREE.MathUtils.lerp(npc.shake, targetShake, dt);
 }
 
 // --- CHAOS DIRECTOR ---
 function scheduleNextEvent() {
     const [min, max] = CONFIG.chaosInterval;
-    const delay = Math.random() * (max - min) + min;
+    // Events come faster when NPC is already stressed
+    const stressMod = 1 - (npc.alertLevel * 0.3);
+    const delay = (Math.random() * (max - min) + min) * stressMod;
     
     setTimeout(() => {
         triggerChaos();
         scheduleNextEvent();
+        
+        // Chaos chain - sometimes events come in rapid succession
+        if (Math.random() < CONFIG.chaosChainChance) {
+            setTimeout(() => triggerChaos(), 800 + Math.random() * 1500);
+            if (Math.random() < 0.3) {
+                setTimeout(() => triggerChaos(), 2000 + Math.random() * 2000);
+            }
+        }
     }, delay);
 }
 
 function triggerChaos() {
     const eventType = Math.random();
     
-    if (eventType < 0.35) {
+    if (eventType < 0.20) {
         spawnFlyingCar();
-    } else if (eventType < 0.6) {
+    } else if (eventType < 0.35) {
         spawnExplosion();
-    } else if (eventType < 0.8) {
+    } else if (eventType < 0.50) {
         spawnFallingDebris();
-    } else {
+    } else if (eventType < 0.60) {
         activateHelicopterSearch();
+    } else if (eventType < 0.72) {
+        spawnGunshots();
+    } else if (eventType < 0.82) {
+        spawnScreaming();
+    } else if (eventType < 0.92) {
+        spawnCarCrash();
+    } else {
+        spawnRunningPerson();
     }
+    
+    // Track danger in NPC memory
+    npc.recentDangerCount++;
+    setTimeout(() => npc.recentDangerCount = Math.max(0, npc.recentDangerCount - 1), 10000);
     
     console.log("CHAOS EVENT TRIGGERED");
 }
@@ -760,7 +1296,7 @@ function spawnFlyingCar() {
         Math.random() * 5
     );
     
-    // Visual
+    // Visual - use GLB model if available, fallback to procedural
     const carGeo = new THREE.BoxGeometry(carSize.x * 2, carSize.y * 2, carSize.z * 2);
     const carMat = new THREE.MeshStandardMaterial({ 
         color: 0x990000,
@@ -768,7 +1304,10 @@ function spawnFlyingCar() {
         roughness: 0.3
     });
     
-    registerPhysicsObject(carBody, carGeo, carMat, 8000);
+    registerPhysicsObjectWithModel(carBody, 'flyingCar', carGeo, carMat, 8000);
+    
+    // Play car crash sound
+    playSound('carCrash', 0.8);
     
     // NPC reacts
     npc.lastDangerPos.set(carBody.position.x, carBody.position.y, carBody.position.z);
@@ -783,6 +1322,9 @@ function spawnExplosion() {
         0,
         (Math.random() - 0.5) * 30
     );
+    
+    // Play explosion sound
+    playSound('explosion', 1.0);
     
     // Spawn multiple debris pieces
     for (let i = 0; i < 8; i++) {
@@ -816,7 +1358,7 @@ function spawnExplosion() {
             emissive: Math.random() > 0.5 ? 0x331100 : 0x000000
         });
         
-        registerPhysicsObject(body, geo, mat, 6000);
+        registerPhysicsObjectWithModel(body, 'explosionDebris', geo, mat, 6000, 0.5 + Math.random() * 0.5);
     }
     
     // Flash effect
@@ -826,7 +1368,6 @@ function spawnExplosion() {
     scene.add(flash);
     
     // Fade out flash
-    const startIntensity = 50;
     const fadeFlash = () => {
         flash.intensity *= 0.85;
         if (flash.intensity > 0.1) {
@@ -869,7 +1410,10 @@ function spawnFallingDebris() {
                 roughness: 0.9
             });
             
-            registerPhysicsObject(body, geo, mat, 8000);
+            registerPhysicsObjectWithModel(body, 'debris', geo, mat, 8000, size * 0.5);
+            
+            // Play debris sound when spawned
+            playSound('debris', 0.5 + Math.random() * 0.3);
         }, i * 300);
     }
     
@@ -892,6 +1436,9 @@ function activateHelicopterSearch() {
     
     heliLight.intensity = 100;
     
+    // Play helicopter sound (looped)
+    const heliSound = playSound('helicopter', 0.6, true);
+    
     // Sweep the searchlight
     let angle = 0;
     const radius = 15;
@@ -911,6 +1458,9 @@ function activateHelicopterSearch() {
             npc.status = 'COWERING';
             npc.panicTimer = 3;
             npc.lastDangerPos.copy(lightPos);
+            
+            // Calculate cover direction (away from the light)
+            npc.coverDirection.subVectors(npcPos, lightPos).normalize();
         }
     }, 50);
     
@@ -918,13 +1468,276 @@ function activateHelicopterSearch() {
     setTimeout(() => {
         clearInterval(sweep);
         heliLight.intensity = 0;
+        stopSound(heliSound);
     }, 8000);
     
     npc.status = 'LOOKING';
     npc.lastDangerPos.set(0, 0, 0);
 }
 
+function spawnGunshots() {
+    // Muzzle flashes from a random direction
+    const angle = Math.random() * Math.PI * 2;
+    const distance = 15 + Math.random() * 20;
+    const shotPos = new THREE.Vector3(
+        npc.body.position.x + Math.cos(angle) * distance,
+        1 + Math.random() * 2,
+        npc.body.position.z + Math.sin(angle) * distance
+    );
+    
+    const shotCount = 3 + Math.floor(Math.random() * 5);
+    
+    for (let i = 0; i < shotCount; i++) {
+        setTimeout(() => {
+            // Muzzle flash light
+            const flash = new THREE.PointLight(0xffaa00, 30, 15);
+            flash.position.copy(shotPos);
+            flash.position.x += (Math.random() - 0.5) * 2;
+            flash.position.z += (Math.random() - 0.5) * 2;
+            scene.add(flash);
+            
+            // Optional: Add muzzle flash model
+            const muzzleModel = loadedModels['muzzleFlash'];
+            if (muzzleModel) {
+                const muzzle = muzzleModel.clone();
+                muzzle.position.copy(flash.position);
+                muzzle.scale.setScalar(0.5);
+                scene.add(muzzle);
+                setTimeout(() => scene.remove(muzzle), 50);
+            }
+            
+            // Play gunshot sound
+            playSound('gunshot', 0.7 + Math.random() * 0.3);
+            
+            setTimeout(() => scene.remove(flash), 50 + Math.random() * 50);
+        }, i * (100 + Math.random() * 150));
+    }
+    
+    // NPC immediately ducks and panics
+    npc.lastDangerPos.copy(shotPos);
+    npc.alertLevel = Math.min(1, npc.alertLevel + 0.4);
+    
+    // Play gasp sound
+    playSound('gasp', 0.6);
+    
+    if (npc.status === 'IDLE' || npc.status === 'CAUTIOUS') {
+        npc.status = 'PANIC';
+        npc.panicTimer = 8 + Math.random() * 6;
+        npc.targetNode = null;
+    } else if (npc.status === 'COWERING') {
+        // Stay down longer if already hiding
+        npc.panicTimer += 4;
+    }
+    
+    // Add to danger memory
+    npc.dangerMemory.push({ pos: shotPos.clone(), time: Date.now(), type: 'gunshots' });
+    if (npc.dangerMemory.length > 5) npc.dangerMemory.shift();
+}
+
+function spawnScreaming() {
+    // Someone screaming nearby - NPC looks around nervously
+    const angle = Math.random() * Math.PI * 2;
+    const distance = 8 + Math.random() * 15;
+    const screamPos = new THREE.Vector3(
+        npc.body.position.x + Math.cos(angle) * distance,
+        1,
+        npc.body.position.z + Math.sin(angle) * distance
+    );
+    
+    // Play scream sound
+    playSound('scream', 0.7 + Math.random() * 0.3);
+    
+    npc.lastDangerPos.copy(screamPos);
+    npc.alertLevel = Math.min(1, npc.alertLevel + 0.25);
+    
+    if (npc.status === 'IDLE') {
+        // Look toward the scream, might panic
+        npc.status = 'LOOKING';
+        npc.panicTimer = 3;
+        
+        setTimeout(() => {
+            if (npc.status === 'LOOKING' && Math.random() > 0.4) {
+                npc.status = 'PANIC';
+                npc.panicTimer = 6 + Math.random() * 4;
+                npc.targetNode = null;
+            }
+        }, 1500);
+    }
+    
+    npc.dangerMemory.push({ pos: screamPos.clone(), time: Date.now(), type: 'scream' });
+    if (npc.dangerMemory.length > 5) npc.dangerMemory.shift();
+}
+
+function spawnCarCrash() {
+    // Two cars colliding on the street
+    const crashZ = (Math.random() - 0.5) * 40;
+    const crashPos = new THREE.Vector3(0, 0.5, crashZ);
+    
+    // Play car crash sound
+    playSound('carCrash', 1.0);
+    
+    // Spawn crashed car debris
+    for (let i = 0; i < 6; i++) {
+        const size = 0.4 + Math.random() * 0.8;
+        const shape = new CANNON.Box(new CANNON.Vec3(size, size * 0.5, size));
+        const body = new CANNON.Body({ mass: 100 + Math.random() * 200, shape });
+        
+        body.position.set(
+            crashPos.x + (Math.random() - 0.5) * 4,
+            0.5 + Math.random(),
+            crashPos.z + (Math.random() - 0.5) * 4
+        );
+        
+        body.velocity.set(
+            (Math.random() - 0.5) * 15,
+            3 + Math.random() * 8,
+            (Math.random() - 0.5) * 15
+        );
+        
+        body.angularVelocity.set(
+            Math.random() * 8,
+            Math.random() * 8,
+            Math.random() * 8
+        );
+        
+        const geo = new THREE.BoxGeometry(size * 2, size, size * 2);
+        const colors = [0x222222, 0x333344, 0x880000, 0x004488];
+        const mat = new THREE.MeshStandardMaterial({ 
+            color: colors[Math.floor(Math.random() * colors.length)],
+            metalness: 0.7,
+            roughness: 0.4
+        });
+        
+        registerPhysicsObjectWithModel(body, 'crashedCar', geo, mat, 10000, size);
+    }
+    
+    // Bright flash from impact
+    const flash = new THREE.PointLight(0xffffaa, 80, 40);
+    flash.position.copy(crashPos);
+    flash.position.y = 2;
+    scene.add(flash);
+    
+    const fadeFlash = () => {
+        flash.intensity *= 0.8;
+        if (flash.intensity > 0.1) {
+            requestAnimationFrame(fadeFlash);
+        } else {
+            scene.remove(flash);
+        }
+    };
+    fadeFlash();
+    
+    // NPC reacts strongly
+    npc.lastDangerPos.copy(crashPos);
+    npc.alertLevel = Math.min(1, npc.alertLevel + 0.5);
+    npc.status = 'PANIC';
+    npc.panicTimer = 10 + Math.random() * 5;
+    npc.targetNode = null;
+    
+    npc.dangerMemory.push({ pos: crashPos.clone(), time: Date.now(), type: 'crash' });
+    if (npc.dangerMemory.length > 5) npc.dangerMemory.shift();
+}
+
+function spawnRunningPerson() {
+    // Someone running past - makes NPC nervous
+    const startSide = Math.random() > 0.5 ? -1 : 1;
+    const runnerZ = npc.body.position.z + (Math.random() - 0.5) * 20;
+    
+    // Visual: Use GLB model if available, fallback to capsule
+    let runner;
+    const runnerModel = loadedModels['npcRunner'];
+    if (runnerModel) {
+        runner = runnerModel.clone();
+        runner.scale.setScalar(1);
+    } else {
+        const runnerGeo = new THREE.CapsuleGeometry(0.3, 1.2, 4, 8);
+        const runnerMat = new THREE.MeshStandardMaterial({ color: 0x111111 });
+        runner = new THREE.Mesh(runnerGeo, runnerMat);
+    }
+    runner.position.set(startSide * 25, 1, runnerZ);
+    runner.castShadow = true;
+    scene.add(runner);
+    
+    // Play footsteps sound
+    const footstepsSound = playSound('footsteps', 0.4, true);
+    
+    const runSpeed = 12 + Math.random() * 5;
+    const direction = -startSide;
+    
+    const animateRunner = () => {
+        runner.position.x += direction * runSpeed * 0.016;
+        runner.position.y = 1 + Math.sin(Date.now() * 0.02) * 0.1; // Bobbing
+        runner.rotation.y = direction > 0 ? Math.PI / 2 : -Math.PI / 2;
+        
+        if (Math.abs(runner.position.x) < 30) {
+            requestAnimationFrame(animateRunner);
+        } else {
+            scene.remove(runner);
+            stopSound(footstepsSound);
+        }
+    };
+    animateRunner();
+    
+    // NPC notices and gets nervous
+    const runnerPos = new THREE.Vector3(0, 1, runnerZ);
+    npc.lastDangerPos.copy(runnerPos);
+    npc.alertLevel = Math.min(1, npc.alertLevel + 0.15);
+    
+    if (npc.status === 'IDLE') {
+        npc.status = 'LOOKING';
+        npc.panicTimer = 2;
+        
+        // Might start running too
+        setTimeout(() => {
+            if (npc.status === 'LOOKING' && Math.random() > 0.6) {
+                npc.status = 'PANIC';
+                npc.panicTimer = 5;
+                npc.targetNode = null;
+            }
+        }, 1000);
+    }
+}
+
 // --- PHYSICS OBJECT MANAGEMENT ---
+
+// Register physics object with optional GLB model support
+function registerPhysicsObjectWithModel(body, modelKey, fallbackGeo, fallbackMat, lifetime = 10000, modelScale = 1) {
+    world.addBody(body);
+    
+    // Try to use loaded GLB model, fallback to procedural mesh
+    const model = loadedModels[modelKey];
+    let mesh;
+    
+    if (model) {
+        mesh = model.clone();
+        mesh.scale.setScalar(modelScale);
+        mesh.traverse(child => {
+            if (child.isMesh) {
+                child.castShadow = true;
+                child.receiveShadow = true;
+            }
+        });
+    } else {
+        mesh = new THREE.Mesh(fallbackGeo, fallbackMat);
+        mesh.castShadow = true;
+        mesh.receiveShadow = true;
+    }
+    
+    scene.add(mesh);
+    
+    const index = physicsBodies.length;
+    physicsBodies.push(body);
+    physicsMeshes.push(mesh);
+    
+    // Cleanup after lifetime
+    setTimeout(() => {
+        world.removeBody(body);
+        scene.remove(mesh);
+        physicsBodies[index] = null;
+        physicsMeshes[index] = null;
+    }, lifetime);
+}
+
 function registerPhysicsObject(body, geometry, material, lifetime = 10000) {
     world.addBody(body);
     
