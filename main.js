@@ -368,7 +368,7 @@ let npc = {
     body: null,
     mesh: null,
     status: 'IDLE', // IDLE, PANIC, COWERING, LOOKING, CAUTIOUS
-    targetNode: null,
+    targetNode: null, 
     shake: 0,
     yaw: 0,      // Horizontal rotation (left/right)
     pitch: 0,    // Vertical rotation (up/down) - clamped to prevent flip
@@ -398,6 +398,9 @@ let activeChaosSources = [];
 init();
 
 async function init() {
+    // 0. PRELOAD SOUNDS
+    preloadSounds();
+    
     // 1. SCENE SETUP
     scene = new THREE.Scene();
     scene.background = new THREE.Color(0x0a0a12);
@@ -466,26 +469,17 @@ async function init() {
 
 // --- ASSET PRELOADING ---
 // Attempts to load all models in background - uses procedural fallbacks if not found
-async function preloadAssets() {
-    console.log('Preloading assets...');
-    
-    // Try to load all models (non-blocking, fallbacks are used if not found)
-    const modelKeys = Object.keys(ASSETS.models);
-    for (const key of modelKeys) {
-        loadModel(key).catch(() => {}); // Silent fail, procedural fallback used
-    }
-    
-    // Preload sounds (also non-blocking)
+function preloadSounds() {
+    // Preload sounds (non-blocking)
     const soundKeys = Object.keys(ASSETS.sounds);
     for (const key of soundKeys) {
         loadSound(key);
     }
-    
-    console.log('Asset preload initiated (models load in background)');
+    console.log('Sound preload initiated');
 }
 
 // --- NPC CREATION ---
-function createNPC() {
+function createNPC(spawnPoint = new THREE.Vector3(0, 1, 0)) {
     const sphereShape = new CANNON.Sphere(0.35);
     npc.body = new CANNON.Body({ 
         mass: 70, 
@@ -493,8 +487,10 @@ function createNPC() {
         angularDamping: 0.99,
         linearDamping: 0.4
     });
-    npc.body.position.set(0, 1, 0);
+    npc.body.position.set(spawnPoint.x, spawnPoint.y + 0.5, spawnPoint.z);
     world.addBody(npc.body);
+    
+    console.log(`NPC spawned at: ${spawnPoint.x.toFixed(1)}, ${spawnPoint.y.toFixed(1)}, ${spawnPoint.z.toFixed(1)}`);
     
     // Visual representation (invisible but useful for debugging)
     if (CONFIG.showDebug) {
@@ -840,23 +836,23 @@ function buildNavigationGrid() {
             const x = side * (streetW / 2 + sidewalkW / 2);
             navNodes.push(new THREE.Vector3(x, 0.2, z));
             
-            if (CONFIG.showDebug) {
-                const dot = new THREE.Mesh(
+                    if (CONFIG.showDebug) {
+                        const dot = new THREE.Mesh(
                     new THREE.SphereGeometry(0.1),
                     new THREE.MeshBasicMaterial({ color: 0x00ff00 })
-                );
+                        );
                 dot.position.set(x, 0.3, z);
-                scene.add(dot);
-            }
+                        scene.add(dot);
+                    }
         });
-    }
+                }
     
     // Road crossing nodes (sparse)
     for (let z = -streetLen / 2 + 10; z < streetLen / 2 - 10; z += 15) {
         for (let x = -streetW / 2 + 1; x < streetW / 2; x += 2) {
             navNodes.push(new THREE.Vector3(x, 0.05, z));
+            }
         }
-    }
     
     console.log(`Navigation grid built: ${navNodes.length} nodes, ${coverSpots.length} cover spots`);
 }
@@ -897,7 +893,7 @@ function getSafeNode(dangerPos, npcPos) {
         }
         return furthest;
     }
-    
+
     // Pick closest safe node to NPC
     if (npcPos) {
         let closest = safeNodes[0];
@@ -1076,7 +1072,7 @@ function handlePanicState(pos, dt) {
     npc.alertLevel = 1;
     
     // Find safe spot away from danger (considering all remembered dangers)
-    if (!npc.targetNode) {
+        if (!npc.targetNode) {
         // Find the most threatening danger position (closest or most recent)
         let primaryDanger = npc.lastDangerPos;
         if (npc.dangerMemory.length > 0) {
@@ -1106,16 +1102,16 @@ function handlePanicState(pos, dt) {
         npc.stuckTime = 0;
     }
     
-    if (npc.targetNode) {
-        const dir = new THREE.Vector3().subVectors(npc.targetNode, pos).normalize();
-        
+        if (npc.targetNode) {
+            const dir = new THREE.Vector3().subVectors(npc.targetNode, pos).normalize();
+            
         // Run speed - faster when fleeing, slightly erratic
         const baseSpeed = npc.fleeAfterHide ? 8.5 : 7.5;
         const speedVariation = Math.sin(clock.getElapsedTime() * 8) * 0.5;
         const speed = baseSpeed + speedVariation;
-        npc.body.velocity.x = dir.x * speed;
-        npc.body.velocity.z = dir.z * speed;
-
+            npc.body.velocity.x = dir.x * speed;
+            npc.body.velocity.z = dir.z * speed;
+            
         // Add a sideways nudge when we're not making progress to slip around obstacles
         if (npc.stuckTime > 0.4) {
             const sidestep = (Math.random() - 0.5) * 4;
@@ -1225,7 +1221,7 @@ function handleCoweringState(pos, dt) {
         if (npc.dangerMemory.length > 1 && Math.random() > 0.6) {
             const danger = npc.dangerMemory[Math.floor(Math.random() * npc.dangerMemory.length)];
             lookTarget = danger.pos.clone();
-        } else {
+    } else {
             lookTarget = npc.lastDangerPos.clone();
         }
         lookTarget.y = camera.position.y - 0.2;
@@ -1537,7 +1533,7 @@ function spawnExplosion() {
     // Spawn multiple debris pieces
     for (let i = 0; i < 8; i++) {
         const size = 0.3 + Math.random() * 0.5;
-        const shape = new CANNON.Box(new CANNON.Vec3(size, size, size));
+    const shape = new CANNON.Box(new CANNON.Vec3(size, size, size));
         const body = new CANNON.Body({ mass: 20 + Math.random() * 30, shape });
         
         body.position.set(
@@ -2004,8 +2000,8 @@ function animate() {
     // Sync physics visuals (skip nulls)
     for (let i = 0; i < physicsBodies.length; i++) {
         if (physicsBodies[i] && physicsMeshes[i]) {
-            physicsMeshes[i].position.copy(physicsBodies[i].position);
-            physicsMeshes[i].quaternion.copy(physicsBodies[i].quaternion);
+        physicsMeshes[i].position.copy(physicsBodies[i].position);
+        physicsMeshes[i].quaternion.copy(physicsBodies[i].quaternion);
         }
     }
 
