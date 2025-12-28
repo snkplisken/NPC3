@@ -8,43 +8,64 @@ import { BodyCamShader } from './BodyCamShader.js';
 
 // --- CONFIGURATION ---
 const CONFIG = {
-    streetLength: 60,
-    streetWidth: 12,
-    sidewalkWidth: 4,
-    buildingCount: 8,
-    chaosInterval: [8000, 18000], // Balanced event frequency
-    chaosChainChance: 0.25,       // 25% chance of rapid follow-up event
-    showDebug: false
+    // Path to your single environment GLB file
+    environmentModel: './environment.glb',
+    
+    // Chaos event timing
+    chaosInterval: [8000, 18000],
+    chaosChainChance: 0.25,
+    
+    // Debug visualization
+    showDebug: false,
+    
+    // Fallback: if no GLB found, generate procedural environment
+    useProcedural: true,
+    proceduralSettings: {
+        streetLength: 60,
+        streetWidth: 12,
+        sidewalkWidth: 4,
+        buildingCount: 8
+    }
 };
 
-// --- ASSET PATHS (point these to your own GLB models & sounds) ---
-// All paths are relative to /assets/ folder - create this folder and add your files
+/*
+=============================================================================
+NAMING CONVENTION FOR YOUR 3D MODEL (Blender/Maya/etc)
+=============================================================================
+
+Name your objects with these PREFIXES to automatically set up the scene:
+
+COLLISION / PHYSICS:
+  collider_*      - Static physics collider (invisible, blocks movement)
+  collider_box_*  - Box-shaped collider
+  
+NAVIGATION:
+  walkable_*      - Surface the NPC can walk on (used for nav grid)
+  cover_*         - Hiding spot (NPC will run here when panicking)
+  spawn_*         - NPC spawn point (uses first one found)
+  
+LIGHTING:
+  light_point_*   - Point light (uses object position, set color in Blender)
+  light_spot_*    - Spotlight
+  light_street_*  - Streetlight with automatic glow effect
+  
+SPECIAL OBJECTS:
+  intlight_*      - Interior light/window glow (emissive material)
+  prop_*          - Decorative prop (no physics)
+  vehicle_*       - Parked vehicle (gets physics collider)
+  
+EXAMPLES:
+  - "walkable_sidewalk"     → NPC can walk here
+  - "collider_building_01"  → Invisible wall
+  - "cover_alley"           → Hiding spot
+  - "light_street_lamp_01"  → Creates point light + glow
+  - "spawn_main"            → NPC starts here
+
+=============================================================================
+*/
+
+// --- ASSET PATHS ---
 const ASSETS = {
-    models: {
-        // Environment
-        building1: 'models/building_tall.glb',
-        building2: 'models/building_medium.glb', 
-        building3: 'models/building_short.glb',
-        busStop: 'models/bus_stop.glb',
-        streetLight: 'models/street_light.glb',
-        sidewalk: 'models/sidewalk.glb',
-        road: 'models/road.glb',
-        
-        // Vehicles
-        parkedCar: 'models/car_parked.glb',
-        flyingCar: 'models/car_flying.glb',
-        crashedCar: 'models/car_crashed.glb',
-        
-        // Characters
-        npcMain: 'models/npc_main.glb',       // The bodycam wearer
-        npcRunner: 'models/npc_runner.glb',   // Panicked running person
-        npcCivilian: 'models/npc_civilian.glb',
-        
-        // Props/Effects
-        debris: 'models/debris.glb',
-        muzzleFlash: 'models/muzzle_flash.glb',
-        explosionDebris: 'models/explosion_debris.glb',
-    },
     sounds: {
         // Ambient
         cityAmbience: 'sounds/city_ambience.mp3',
@@ -66,59 +87,40 @@ const ASSETS = {
 };
 
 // --- LOADED ASSETS CACHE ---
-const loadedModels = {};
 const loadedSounds = {};
 const gltfLoader = new GLTFLoader();
 
-// Asset loading functions
-async function loadModel(key) {
-    if (loadedModels[key]) return loadedModels[key];
-    
-    const path = ASSETS.models[key];
-    if (!path) {
-        console.warn(`Model key "${key}" not found in ASSETS.models`);
-        return null;
-    }
-    
-    try {
-        const gltf = await gltfLoader.loadAsync(`./assets/${path}`);
-        loadedModels[key] = gltf.scene;
-        console.log(`Loaded model: ${key}`);
-        return gltf.scene;
-    } catch (e) {
-        // Model not found - will use procedural fallback
-        console.log(`Model "${key}" not found, using procedural mesh`);
-        return null;
-    }
-}
+// Environment data extracted from GLB
+let environmentData = {
+    loaded: false,
+    spawnPoint: new THREE.Vector3(0, 1, 0),
+    lightPositions: [],
+    coverPositions: []
+};
 
+// Sound loading and playback
 function loadSound(key) {
     if (loadedSounds[key]) return loadedSounds[key];
     
     const path = ASSETS.sounds[key];
-    if (!path) {
-        console.warn(`Sound key "${key}" not found in ASSETS.sounds`);
-        return null;
-    }
+    if (!path) return null;
     
     try {
         const audio = new Audio(`./assets/${path}`);
         loadedSounds[key] = audio;
         return audio;
     } catch (e) {
-        console.log(`Sound "${key}" not found`);
         return null;
     }
 }
 
-// Play sound helper with volume and optional position for 3D audio
 function playSound(key, volume = 1.0, loop = false) {
     const sound = loadSound(key);
     if (sound) {
         const instance = sound.cloneNode();
         instance.volume = Math.min(1, Math.max(0, volume));
         instance.loop = loop;
-        instance.play().catch(() => {}); // Ignore autoplay errors
+        instance.play().catch(() => {});
         return instance;
     }
     return null;
@@ -131,25 +133,228 @@ function stopSound(audioInstance) {
     }
 }
 
-// Create mesh from loaded model or fallback to procedural
-function createMeshFromModel(key, fallbackGeometry, fallbackMaterial, scale = 1) {
-    const model = loadedModels[key];
-    if (model) {
-        const clone = model.clone();
-        clone.scale.setScalar(scale);
-        clone.traverse(child => {
-            if (child.isMesh) {
-                child.castShadow = true;
-                child.receiveShadow = true;
-            }
-        });
-        return clone;
+// --- ENVIRONMENT GLB LOADER ---
+async function loadEnvironmentGLB() {
+    try {
+        console.log(`Loading environment from: ${CONFIG.environmentModel}`);
+        const gltf = await gltfLoader.loadAsync(CONFIG.environmentModel);
+        
+        console.log('Environment GLB loaded, parsing tagged objects...');
+        parseEnvironmentScene(gltf.scene);
+        
+        // Add the environment to the scene
+        scene.add(gltf.scene);
+        environmentData.loaded = true;
+        
+        return true;
+    } catch (e) {
+        console.warn('Environment GLB not found, using procedural fallback');
+        return false;
     }
-    // Fallback to procedural mesh
-    const mesh = new THREE.Mesh(fallbackGeometry, fallbackMaterial);
-    mesh.castShadow = true;
-    mesh.receiveShadow = true;
-    return mesh;
+}
+
+// Parse the GLB scene and set up physics, lights, nav based on object names
+function parseEnvironmentScene(envScene) {
+    const walkableSurfaces = [];
+    
+    envScene.traverse((child) => {
+        const name = child.name.toLowerCase();
+        
+        // Enable shadows on all meshes
+        if (child.isMesh) {
+            child.castShadow = true;
+            child.receiveShadow = true;
+        }
+        
+        // --- COLLIDERS ---
+        if (name.startsWith('collider')) {
+            // Make collider invisible but keep for physics
+            if (child.isMesh) {
+                child.visible = false;
+            }
+            createColliderFromObject(child);
+        }
+        
+        // --- WALKABLE SURFACES ---
+        if (name.startsWith('walkable')) {
+            walkableSurfaces.push(child);
+            // Also create physics collider for walkable surfaces
+            if (child.isMesh) {
+                createColliderFromObject(child);
+            }
+        }
+        
+        // --- COVER SPOTS ---
+        if (name.startsWith('cover')) {
+            const pos = new THREE.Vector3();
+            child.getWorldPosition(pos);
+            coverSpots.push(pos);
+            environmentData.coverPositions.push(pos.clone());
+            
+            if (CONFIG.showDebug) {
+                const marker = new THREE.Mesh(
+                    new THREE.SphereGeometry(0.3),
+                    new THREE.MeshBasicMaterial({ color: 0x0000ff, wireframe: true })
+                );
+                marker.position.copy(pos);
+                scene.add(marker);
+            }
+            console.log(`Cover spot found: ${child.name} at`, pos);
+        }
+        
+        // --- SPAWN POINTS ---
+        if (name.startsWith('spawn')) {
+            const pos = new THREE.Vector3();
+            child.getWorldPosition(pos);
+            environmentData.spawnPoint.copy(pos);
+            console.log(`Spawn point found: ${child.name} at`, pos);
+        }
+        
+        // --- LIGHTS ---
+        if (name.startsWith('light_point') || name.startsWith('light_street')) {
+            const pos = new THREE.Vector3();
+            child.getWorldPosition(pos);
+            
+            // Create point light at this position
+            const light = new THREE.PointLight(0xffeedd, 40, 25);
+            light.position.copy(pos);
+            light.castShadow = true;
+            light.shadow.mapSize.width = 256;
+            light.shadow.mapSize.height = 256;
+            scene.add(light);
+            
+            // Add glow sprite for streetlights
+            if (name.includes('street')) {
+                const glowMat = new THREE.SpriteMaterial({ 
+                    color: 0xfff8e8, 
+                    transparent: true, 
+                    opacity: 0.6 
+                });
+                const glow = new THREE.Sprite(glowMat);
+                glow.scale.set(1.5, 1.5, 1);
+                glow.position.copy(pos);
+                scene.add(glow);
+            }
+            
+            environmentData.lightPositions.push(pos.clone());
+            console.log(`Light created: ${child.name} at`, pos);
+        }
+        
+        if (name.startsWith('light_spot')) {
+            const pos = new THREE.Vector3();
+            child.getWorldPosition(pos);
+            
+            const spotlight = new THREE.SpotLight(0xffffff, 30, 20, Math.PI / 6, 0.5);
+            spotlight.position.copy(pos);
+            spotlight.castShadow = true;
+            scene.add(spotlight);
+            scene.add(spotlight.target);
+            
+            console.log(`Spotlight created: ${child.name} at`, pos);
+        }
+        
+        // --- VEHICLES (get physics) ---
+        if (name.startsWith('vehicle')) {
+            createColliderFromObject(child);
+        }
+        
+        // --- INTERIOR LIGHTS / WINDOWS ---
+        if (name.startsWith('intlight') || name.startsWith('window')) {
+            // Make material emissive if it isn't already
+            if (child.isMesh && child.material) {
+                const mat = child.material.clone();
+                mat.emissive = mat.color || new THREE.Color(0xfff5e0);
+                mat.emissiveIntensity = 0.5;
+                child.material = mat;
+            }
+        }
+    });
+    
+    // Build navigation grid from walkable surfaces
+    if (walkableSurfaces.length > 0) {
+        buildNavGridFromSurfaces(walkableSurfaces);
+    }
+    
+    console.log(`Environment parsed: ${coverSpots.length} cover spots, ${environmentData.lightPositions.length} lights`);
+}
+
+// Create a physics collider from a mesh object
+function createColliderFromObject(obj) {
+    if (!obj.isMesh) {
+        // For empty objects, use position as a small box
+        const pos = new THREE.Vector3();
+        obj.getWorldPosition(pos);
+        const shape = new CANNON.Box(new CANNON.Vec3(0.5, 0.5, 0.5));
+        const body = new CANNON.Body({ mass: 0, shape });
+        body.position.copy(pos);
+        world.addBody(body);
+        return;
+    }
+    
+    // Get world-space bounding box
+    const box = new THREE.Box3().setFromObject(obj);
+    const size = new THREE.Vector3();
+    const center = new THREE.Vector3();
+    box.getSize(size);
+    box.getCenter(center);
+    
+    // Skip tiny objects
+    if (size.x < 0.1 || size.y < 0.1 || size.z < 0.1) return;
+    
+    const shape = new CANNON.Box(new CANNON.Vec3(size.x / 2, size.y / 2, size.z / 2));
+    const body = new CANNON.Body({ mass: 0, shape });
+    body.position.set(center.x, center.y, center.z);
+    world.addBody(body);
+}
+
+// Build navigation grid by raycasting onto walkable surfaces
+function buildNavGridFromSurfaces(surfaces) {
+    console.log('Building navigation grid from walkable surfaces...');
+    
+    const raycaster = new THREE.Raycaster();
+    const down = new THREE.Vector3(0, -1, 0);
+    
+    // Get bounds of all walkable surfaces
+    const totalBounds = new THREE.Box3();
+    surfaces.forEach(surf => {
+        const box = new THREE.Box3().setFromObject(surf);
+        totalBounds.union(box);
+    });
+    
+    const min = totalBounds.min;
+    const max = totalBounds.max;
+    const step = 1.5; // Grid spacing
+    
+    for (let x = min.x; x <= max.x; x += step) {
+        for (let z = min.z; z <= max.z; z += step) {
+            const origin = new THREE.Vector3(x, max.y + 5, z);
+            raycaster.set(origin, down);
+            
+            for (const surface of surfaces) {
+                const intersects = raycaster.intersectObject(surface, true);
+                if (intersects.length > 0) {
+                    const hit = intersects[0];
+                    // Only add if surface is relatively flat
+                    if (hit.face && hit.face.normal.y > 0.7) {
+                        navNodes.push(hit.point.clone());
+                        
+                        if (CONFIG.showDebug) {
+                            const dot = new THREE.Mesh(
+                                new THREE.SphereGeometry(0.1),
+                                new THREE.MeshBasicMaterial({ color: 0x00ff00 })
+                            );
+                            dot.position.copy(hit.point);
+                            dot.position.y += 0.1;
+                            scene.add(dot);
+                        }
+                    }
+                    break; // Only need one hit per grid point
+                }
+            }
+        }
+    }
+    
+    console.log(`Navigation grid built: ${navNodes.length} nodes from GLB surfaces`);
 }
 
 // --- GLOBALS ---
